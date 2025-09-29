@@ -15,10 +15,6 @@ Descrição:
 Dependências (instale com pip):
   pip install dnspython requests reportlab python-whois
 
-Observações:
-  - whois é opcional: se não instalado, o script seguirá sem whois.
-  - O script não substitui uma varredura profissional (nmap, scanners de vulnerabilidade).
-
 """
 
 import argparse
@@ -47,19 +43,21 @@ try:
 except Exception:
     whois_module = None
 
+# Importando reportlab de forma controlada
 try:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib import colors
     from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
     from reportlab.lib.styles import getSampleStyleSheet
+    reportlab_available = True
 except Exception:
-    # We'll still allow CSV-only runs
-    reportlab = None
+    reportlab_available = False
 
 # Common ports to check
 COMMON_PORTS = [21, 22, 23, 25, 53, 80, 110, 143, 443, 587, 3306, 3389, 8080]
 SOCKET_TIMEOUT = 2.0
 
+# ===================== Funções principais =====================
 
 def resolve_dns(name):
     out = {"A": [], "AAAA": [], "CNAME": [], "MX": [], "NS": []}
@@ -73,7 +71,6 @@ def resolve_dns(name):
             pass
     return out
 
-
 def reverse_dns(ip):
     try:
         name, _, _ = socket.gethostbyaddr(ip)
@@ -81,14 +78,12 @@ def reverse_dns(ip):
     except Exception:
         return ""
 
-
 def whois_lookup(domain):
     if not whois_module:
-        return "whois not installed"
+        return "whois not instalado"
     try:
         w = whois_module.whois(domain)
         if isinstance(w, dict):
-            # python-whois may return a dict-like object
             keys = [k for k in ("domain_name","registrar","creation_date","expiration_date","emails") if k in w]
             return {k: w.get(k) for k in keys}
         else:
@@ -102,7 +97,6 @@ def whois_lookup(domain):
     except Exception as e:
         return f"whois error: {e}"
 
-
 def scan_port(host, port, timeout=SOCKET_TIMEOUT):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(timeout)
@@ -113,7 +107,6 @@ def scan_port(host, port, timeout=SOCKET_TIMEOUT):
     except Exception:
         return False
 
-
 def grab_cert_info(host, port=443, timeout=5):
     info = {"valid_from": None, "valid_to": None, "subject": None, "issuer": None}
     try:
@@ -122,7 +115,6 @@ def grab_cert_info(host, port=443, timeout=5):
         sock = context.wrap_socket(conn, server_hostname=host)
         cert = sock.getpeercert()
         sock.close()
-        # cert is a dict when binary_form=False
         info['subject'] = dict(x[0] for x in cert.get('subject', ())) if cert.get('subject') else None
         info['issuer'] = dict(x[0] for x in cert.get('issuer', ())) if cert.get('issuer') else None
         info['valid_from'] = cert.get('notBefore')
@@ -130,7 +122,6 @@ def grab_cert_info(host, port=443, timeout=5):
     except Exception as e:
         info['error'] = str(e)
     return info
-
 
 def fetch_http_headers(host, port=80, use_https=False, timeout=5):
     if not requests:
@@ -147,21 +138,19 @@ def fetch_http_headers(host, port=80, use_https=False, timeout=5):
     except Exception as e:
         return {"error": str(e)}
 
-
 def check_cert_expired(valid_to_str):
     if not valid_to_str:
         return None
-    # example format: 'Aug 10 12:00:00 2025 GMT'
     try:
         dt = datetime.strptime(valid_to_str, '%b %d %H:%M:%S %Y %Z')
     except Exception:
         try:
-            # try common alternative ISO formats
             dt = datetime.fromisoformat(valid_to_str)
         except Exception:
             return None
     return dt < datetime.utcnow()
 
+# ===================== Análise do host =====================
 
 def analyze_host(host):
     row = {
@@ -182,7 +171,6 @@ def analyze_host(host):
         'vuln_notes': []
     }
 
-    # Resolve A/AAAA
     dns_info = resolve_dns(host)
     row['dns_a'] = dns_info.get('A', [])
     row['dns_aaaa'] = dns_info.get('AAAA', [])
@@ -190,75 +178,63 @@ def analyze_host(host):
     row['dns_mx'] = dns_info.get('MX', [])
     row['dns_ns'] = dns_info.get('NS', [])
 
-    # Set resolved ips list
     ips = row['dns_a'] + row['dns_aaaa']
     row['resolved_ips'] = ips
 
-    # Reverse DNS for each IP
     for ip in ips:
         rd = reverse_dns(ip)
         row['reverse_dns'].append({ip: rd})
 
-    # whois
     try:
         w = whois_lookup(host)
         row['whois'] = w
     except Exception as e:
         row['whois'] = f"whois failed: {e}"
 
-    # Port scan
     for port in COMMON_PORTS:
         try:
-            is_open = scan_port(host, port)
-            if is_open:
+            if scan_port(host, port):
                 row['open_ports'].append(port)
         except Exception:
             pass
 
-    # HTTP and TLS checks
     try:
-        if 443 in row['open_ports'] or 'https' in row['dns_cname']:
+        if 443 in row['open_ports']:
             cert = grab_cert_info(host, 443)
             if cert.get('error'):
                 row['tls_error'] = cert.get('error')
             else:
                 row['tls_valid_to'] = cert.get('valid_to')
                 row['tls_expired'] = check_cert_expired(cert.get('valid_to'))
-        # fetch http headers on port 80 or 443
         if requests:
             if 80 in row['open_ports']:
                 hdrs = fetch_http_headers(host, 80, use_https=False)
                 if isinstance(hdrs, dict) and 'error' not in hdrs:
                     row['http_server_header'] = hdrs.get('Server')
-                    # check security headers
-                    security_headers = {k: hdrs.get(k) for k in ('Strict-Transport-Security','Content-Security-Policy','X-Frame-Options','X-Content-Type-Options')}
-                    row['security_headers'] = security_headers
-            if 443 in row['open_ports'] and requests:
+                    row['security_headers'] = {k: hdrs.get(k) for k in (
+                        'Strict-Transport-Security','Content-Security-Policy','X-Frame-Options','X-Content-Type-Options')}
+            if 443 in row['open_ports']:
                 hdrs = fetch_http_headers(host, 443, use_https=True)
                 if isinstance(hdrs, dict) and 'error' not in hdrs:
                     row['http_server_header'] = row.get('http_server_header') or hdrs.get('Server')
-                    security_headers = {k: hdrs.get(k) for k in ('Strict-Transport-Security','Content-Security-Policy','X-Frame-Options','X-Content-Type-Options')}
-                    row['security_headers'] = security_headers
+                    row['security_headers'] = {k: hdrs.get(k) for k in (
+                        'Strict-Transport-Security','Content-Security-Policy','X-Frame-Options','X-Content-Type-Options')}
     except Exception as e:
         row['vuln_notes'].append(f"http/tls check error: {e}")
 
-    # Simple vulnerability heuristics
     if any(p in row['open_ports'] for p in (21,23,3306,3389)):
-        row['vuln_notes'].append('Serviços com portas comumente exploradas abertas (verifique autenticacao/patches)')
+        row['vuln_notes'].append('Portas críticas abertas (verifique segurança e patches)')
     if row.get('tls_expired'):
         row['vuln_notes'].append('Certificado TLS expirado')
     if 80 in row['open_ports'] and 443 not in row['open_ports']:
-        row['vuln_notes'].append('HTTP disponível sem HTTPS - risco de interceptacao')
+        row['vuln_notes'].append('HTTP sem HTTPS - risco de interceptação')
 
     return row
 
+# ===================== Exportação =====================
 
 def write_csv(rows, csv_path):
-    # Normalize rows to flat CSV
-    keys = [
-        'input','resolved_ips','dns_a','dns_aaaa','dns_cname','dns_mx','dns_ns','reverse_dns','whois','open_ports',
-        'http_server_header','tls_valid_to','tls_expired','tls_error','vuln_notes'
-    ]
+    keys = ['input','resolved_ips','dns_a','dns_aaaa','dns_cname','dns_mx','dns_ns','reverse_dns','whois','open_ports','http_server_header','tls_valid_to','tls_expired','tls_error','vuln_notes']
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(keys)
@@ -282,9 +258,8 @@ def write_csv(rows, csv_path):
             ])
     print(f"CSV salvo em: {csv_path}")
 
-
 def write_pdf(rows, pdf_path):
-    if reportlab is None:
+    if not reportlab_available:
         print('reportlab não instalado — instale com: pip install reportlab')
         return
     doc = SimpleDocTemplate(pdf_path, pagesize=A4)
@@ -326,6 +301,7 @@ def write_pdf(rows, pdf_path):
     doc.build(elems)
     print(f"PDF salvo em: {pdf_path}")
 
+# ===================== Main =====================
 
 def main():
     parser = argparse.ArgumentParser(description='Auditoria simples por DNS/porta/HTTP/TLS')
